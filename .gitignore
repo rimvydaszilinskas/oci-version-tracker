@@ -2,3 +2,6 @@ target/
 
 .env
 .gitignore
+
+# Ignore coverage reports
+lcov.info
