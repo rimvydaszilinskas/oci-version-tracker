@@ -10,12 +10,12 @@ async fn monitoring_loop(config: AppConfig) {
     );
     loop {
         tracing::info!("Checking for updates...");
-        let tracked_images = version_tracker::load_tracked_images(&config).await;
-        let tracked_images = match tracked_images {
+        let tracked_images = match version_tracker::load_tracked_images(&config).await {
             Ok(images) => images,
             Err(e) => {
-                tracing::error!("Error loading tracked images: {:?}", e);
-                Vec::new()
+                tracing::error!("Error loading tracked images: {:?}. Sleeping 10 seconds", e);
+                sleep(Duration::from_secs(10)).await;
+                continue;
             }
         };
 
@@ -30,15 +30,14 @@ async fn monitoring_loop(config: AppConfig) {
 
         tracked_images.into_iter().for_each(|image| {
             tokio::spawn(async move {
-                match version_tracker::fetch_latest(image).await {
-                    Ok(Some(version)) => match version {
-                        version_tracker::TrackedImageResult::Semver(v) => {
-                            tracing::info!("Found latest version: {}", v)
-                        }
-                        version_tracker::TrackedImageResult::Digest(d) => {
-                            tracing::info!("Found latest digest: {}", d)
-                        }
-                    },
+                match version_tracker::fetch_latest(&image).await {
+                    Ok(Some(version)) => {
+                        tracing::info!(
+                            "Latest version for image {:?}: {}",
+                            image,
+                            version.to_string()
+                        );
+                    }
                     Ok(None) => tracing::info!("No version found"),
                     Err(e) => tracing::error!("Error fetching image: {:?}", e),
                 }

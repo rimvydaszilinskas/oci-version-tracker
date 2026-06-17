@@ -18,5 +18,14 @@
 #     pattern: "9.20.x"
 - name: cimg/go
   strategy:
-    type: latest
-    pattern: "9.20.x"
+    type: semver_pattern
+    pattern: "1.x"
+  update_strategies:
+    - type: filesystem
+      path: ./examples/target.yml
+    #  component: spec.deploy.containers.go-inline.image
+    # target: full
+    # - type: filesystem
+    #   path: ./examples/target.yml
+    #   component: spec.deploy.containers.go-split.tag
+    #   target: tag

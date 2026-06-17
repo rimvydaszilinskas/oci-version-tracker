@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: version-tracker-config
+data:
+  config.yaml: |
+    - name: cimg/go
+      strategy:
+        type: semver_pattern
+        pattern: "1.x"
+      update_strategies:
+        - type: git
+          branch: main
+          path: ./examples/target.yml
+          repository: github.com/rimvydaszilinskas/test-repo

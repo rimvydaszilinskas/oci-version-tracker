@@ -19,16 +19,40 @@ enum TrackingStrategy {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UpdateStrategy {
+    Filesystem {
+        path: String,
+    },
+    Git {
+        repository: String,
+        branch: String,
+        path: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TrackedImage {
     /// The name of the image to track, e.g. `nginx`.
     name: String,
     /// The strategy to use when tracking this image.
     strategy: TrackingStrategy,
+    /// The strategies to use when updating this image.
+    update_strategies: Vec<UpdateStrategy>,
 }
 
 pub enum TrackedImageResult {
     Semver(semver::Version),
     Digest(String),
+}
+
+impl ToString for TrackedImageResult {
+    fn to_string(&self) -> String {
+        match self {
+            TrackedImageResult::Semver(v) => v.to_string(),
+            TrackedImageResult::Digest(d) => d.to_owned(),
+        }
+    }
 }
 
 pub async fn load_tracked_images(config: &AppConfig) -> anyhow::Result<Vec<TrackedImage>> {
@@ -49,13 +73,13 @@ pub async fn load_tracked_images(config: &AppConfig) -> anyhow::Result<Vec<Track
 
 /// Fetches the latest version of the given image according to its tracking strategy.
 pub async fn fetch_latest(
-    image: TrackedImage,
+    image: &TrackedImage,
 ) -> Result<Option<TrackedImageResult>, anyhow::Error> {
     tracing::debug!("Fetching image: {:?}", &image);
     let client = Client::new(ClientConfig::default());
     let reference: Reference = image.name.parse()?;
 
-    match image.strategy {
+    match &image.strategy {
         TrackingStrategy::Latest => {
             tracing::debug!("Tracking strategy: Latest");
             // Rebuild the reference with the "latest" tag to fetch the manifest digest

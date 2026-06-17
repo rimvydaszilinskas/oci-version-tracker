@@ -1,0 +1,11 @@
+# This is rims
+spec:
+  deploy:
+    containers:
+      nginx:
+        image: nginx:latest
+      go-inline:
+        image: cimg/go:9.20.x # vt:cimg/go:full
+      go-split:
+        image: cimg/go
+        tag: 9.20.x # vt:cimg/go:tag
