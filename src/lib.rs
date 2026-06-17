@@ -1,11 +1,11 @@
 use anyhow::Ok;
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::{Api, Client as KubeClient};
 use serde::{Deserialize, Serialize};
 
 mod appconfig;
 pub use appconfig::AppConfig;
-use oci_client::{Client, Reference, client::ClientConfig, secrets::RegistryAuth::Anonymous};
+use oci_client::{Client, Reference, client::ClientConfig, secrets::RegistryAuth};
 use tokio::fs;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,6 +36,22 @@ pub enum UpdateStrategy {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RegistryCredentials {
+    Basic {
+        username: String,
+        password: String,
+    },
+    Bearer {
+        token: String,
+    },
+    /// reference format: "<namespace>/{configmap|secret}/<name>"
+    Kubernetes {
+        reference: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TrackedImage {
     /// The name of the image to track, e.g. `nginx`.
     pub name: String,
@@ -43,6 +59,9 @@ pub struct TrackedImage {
     strategy: TrackingStrategy,
     /// The strategies to use when updating this image.
     pub update_strategies: Vec<UpdateStrategy>,
+    /// Optional credentials for private registries.
+    #[serde(default)]
+    auth: Option<RegistryCredentials>,
 }
 
 pub enum TrackedImageResult {
@@ -128,7 +147,11 @@ fn rewrite_line(
     };
 
     // Split line into value part and comment part
-    let marker = if mode == "full" { &full_marker } else { &tag_marker };
+    let marker = if mode == "full" {
+        &full_marker
+    } else {
+        &tag_marker
+    };
     let (value_part, comment_part) = line.split_once(marker).unwrap();
     // value_part ends with "  # " or " # " — keep that whitespace
     let value_trimmed = value_part.trim_end();
@@ -154,7 +177,10 @@ fn rewrite_line(
                 new_version.to_owned()
             };
 
-            format!("{}: {}{}{}{}", yaml_key, new_value, trailing_space, marker, comment_part)
+            format!(
+                "{}: {}{}{}{}",
+                yaml_key, new_value, trailing_space, marker, comment_part
+            )
         } else {
             line.to_owned()
         }
@@ -164,29 +190,145 @@ fn rewrite_line(
             if !should_update(current_tag, result, override_version) {
                 return line.to_owned();
             }
-            format!("{}: {}{}{}{}", yaml_key, new_version, trailing_space, marker, comment_part)
+            format!(
+                "{}: {}{}{}{}",
+                yaml_key, new_version, trailing_space, marker, comment_part
+            )
         } else {
             line.to_owned()
         }
     }
 }
 
-fn should_update(
-    current: &str,
-    result: &TrackedImageResult,
-    override_version: bool,
-) -> bool {
+fn should_update(current: &str, result: &TrackedImageResult, override_version: bool) -> bool {
     if override_version {
         return true;
     }
     match result {
-        TrackedImageResult::Semver(new) => {
-            match semver::Version::parse(current) {
-                std::result::Result::Ok(current_ver) => new > &current_ver,
-                std::result::Result::Err(_) => true,
+        TrackedImageResult::Semver(new) => match semver::Version::parse(current) {
+            std::result::Result::Ok(current_ver) => new > &current_ver,
+            std::result::Result::Err(_) => true,
+        },
+        TrackedImageResult::Digest(_) => true,
+    }
+}
+
+async fn resolve_auth(creds: &RegistryCredentials) -> anyhow::Result<RegistryAuth> {
+    match creds {
+        RegistryCredentials::Basic { username, password } => {
+            Ok(RegistryAuth::Basic(username.clone(), password.clone()))
+        }
+        RegistryCredentials::Bearer { token } => Ok(RegistryAuth::Bearer(token.clone())),
+        RegistryCredentials::Kubernetes { reference } => {
+            let parts: Vec<&str> = reference.splitn(3, '/').collect();
+            if parts.len() != 3 {
+                return Err(anyhow::anyhow!(
+                    "invalid kubernetes reference '{}': expected <namespace>/{{configmap|secret}}/<name>",
+                    reference
+                ));
+            }
+            let (namespace, resource_type, name) = (parts[0], parts[1], parts[2]);
+            if resource_type != "configmap" && resource_type != "secret" {
+                return Err(anyhow::anyhow!(
+                    "unknown kubernetes resource type '{}': expected 'configmap' or 'secret'",
+                    resource_type
+                ));
+            }
+            let client = KubeClient::try_default().await?;
+            match resource_type {
+                "configmap" => {
+                    let api: Api<ConfigMap> = Api::namespaced(client, namespace);
+                    let cm = api.get(name).await?;
+                    let data = cm
+                        .data
+                        .ok_or_else(|| anyhow::anyhow!("ConfigMap '{}' has no data", name))?;
+                    let username = data
+                        .get("username")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("ConfigMap '{}' missing 'username' key", name)
+                        })?
+                        .clone();
+                    let password = data
+                        .get("password")
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("ConfigMap '{}' missing 'password' key", name)
+                        })?
+                        .clone();
+                    Ok(RegistryAuth::Basic(username, password))
+                }
+                "secret" => {
+                    let api: Api<Secret> = Api::namespaced(client, namespace);
+                    let secret = api.get(name).await?;
+                    let data = secret
+                        .data
+                        .ok_or_else(|| anyhow::anyhow!("Secret '{}' has no data", name))?;
+                    let username_bytes = data.get("username").ok_or_else(|| {
+                        anyhow::anyhow!("Secret '{}' missing 'username' key", name)
+                    })?;
+                    let password_bytes = data.get("password").ok_or_else(|| {
+                        anyhow::anyhow!("Secret '{}' missing 'password' key", name)
+                    })?;
+                    let username = String::from_utf8(username_bytes.0.clone())?;
+                    let password = String::from_utf8(password_bytes.0.clone())?;
+                    Ok(RegistryAuth::Basic(username, password))
+                }
+                _ => unreachable!(),
             }
         }
-        TrackedImageResult::Digest(_) => true,
+    }
+}
+
+/// Fetches the latest version of the given image according to its tracking strategy.
+pub async fn fetch_latest(
+    image: &TrackedImage,
+) -> Result<Option<TrackedImageResult>, anyhow::Error> {
+    tracing::debug!("Fetching image: {:?}", &image);
+    let auth = match &image.auth {
+        Some(creds) => resolve_auth(creds).await?,
+        None => RegistryAuth::Anonymous,
+    };
+    let client = Client::new(ClientConfig::default());
+    let reference: Reference = image.name.parse()?;
+
+    match &image.strategy {
+        TrackingStrategy::Latest => {
+            tracing::debug!("Tracking strategy: Latest");
+            // Rebuild the reference with the "latest" tag to fetch the manifest digest
+            let reference = Reference::with_tag(
+                reference.registry().to_owned(),
+                reference.repository().to_owned(),
+                "latest".to_owned(),
+            );
+
+            let digest = client.fetch_manifest_digest(&reference, &auth).await?;
+
+            tracing::debug!("Latest tag: latest {}: {:?}", reference, digest);
+
+            Ok(Some(TrackedImageResult::Digest(digest)))
+        }
+        TrackingStrategy::SemverPattern { pattern } => {
+            tracing::debug!("Tracking strategy: SemverPattern with pattern {}", pattern);
+            let response = client.list_tags(&reference, &auth, None, None).await?;
+            let mut valid_tags = response
+                .tags
+                .into_iter()
+                .map(|tag| semver::Version::parse(&tag))
+                .filter(|tag| tag.is_ok())
+                .map(|tag| tag.unwrap())
+                .filter(|tag| pattern.matches(tag))
+                .collect::<Vec<_>>();
+            valid_tags.sort();
+
+            let latest_tag = valid_tags.last();
+
+            match latest_tag {
+                None => Ok(None),
+                Some(tag) => {
+                    tracing::debug!("Latest tag matching pattern {}: {}", pattern, tag);
+                    Ok(Some(TrackedImageResult::Semver(tag.to_owned())))
+                }
+            }
+        }
     }
 }
 
@@ -209,6 +351,7 @@ mod tests {
             name: name.to_owned(),
             strategy: TrackingStrategy::Latest,
             update_strategies: vec![],
+            auth: None,
         }
     }
 
@@ -231,12 +374,20 @@ mod tests {
 
     #[test]
     fn should_update_unparseable_current_always_updates() {
-        assert!(should_update("not-a-version", &semver_result("1.1.0"), false));
+        assert!(should_update(
+            "not-a-version",
+            &semver_result("1.1.0"),
+            false
+        ));
     }
 
     #[test]
     fn should_update_digest_always_updates() {
-        assert!(should_update("sha256:abc", &digest_result("sha256:xyz"), false));
+        assert!(should_update(
+            "sha256:abc",
+            &digest_result("sha256:xyz"),
+            false
+        ));
     }
 
     #[test]
@@ -249,13 +400,19 @@ mod tests {
     #[test]
     fn rewrite_line_no_marker_unchanged() {
         let line = "        image: nginx:1.0.0";
-        assert_eq!(rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false), line);
+        assert_eq!(
+            rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false),
+            line
+        );
     }
 
     #[test]
     fn rewrite_line_wrong_image_unchanged() {
         let line = "        tag: 1.0.0 # vt:other:tag";
-        assert_eq!(rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false), line);
+        assert_eq!(
+            rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false),
+            line
+        );
     }
 
     #[test]
@@ -289,7 +446,13 @@ mod tests {
     #[test]
     fn rewrite_line_full_mode_digest_always_updates() {
         let line = "        image: nginx:old-digest # vt:nginx:full";
-        let result = rewrite_line(line, "nginx", "sha256:abc", &digest_result("sha256:abc"), false);
+        let result = rewrite_line(
+            line,
+            "nginx",
+            "sha256:abc",
+            &digest_result("sha256:abc"),
+            false,
+        );
         assert_eq!(result, "        image: nginx:sha256:abc # vt:nginx:full");
     }
 
@@ -313,9 +476,14 @@ mod tests {
         let content = "        tag: 1.0.0 # vt:nginx:tag\n";
         let f = write_temp(content).await;
         let image = tracked_image("nginx");
-        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
-            .await
-            .unwrap();
+        apply_filesystem_update(
+            &image,
+            &semver_result("2.0.0"),
+            f.path().to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
         let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
         assert_eq!(updated, "        tag: 2.0.0 # vt:nginx:tag\n");
     }
@@ -325,9 +493,14 @@ mod tests {
         let content = "        image: nginx:1.0.0 # vt:nginx:full\n";
         let f = write_temp(content).await;
         let image = tracked_image("nginx");
-        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
-            .await
-            .unwrap();
+        apply_filesystem_update(
+            &image,
+            &semver_result("2.0.0"),
+            f.path().to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
         let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
         assert_eq!(updated, "        image: nginx:2.0.0 # vt:nginx:full\n");
     }
@@ -337,9 +510,14 @@ mod tests {
         let content = "        tag: 1.0.0 # vt:nginx:tag\n        tag: 3.0.0 # vt:other:tag\n";
         let f = write_temp(content).await;
         let image = tracked_image("nginx");
-        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
-            .await
-            .unwrap();
+        apply_filesystem_update(
+            &image,
+            &semver_result("2.0.0"),
+            f.path().to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
         let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
         assert!(updated.contains("tag: 2.0.0 # vt:nginx:tag"));
         assert!(updated.contains("tag: 3.0.0 # vt:other:tag"));
@@ -350,9 +528,14 @@ mod tests {
         let content = "        tag: 5.0.0 # vt:nginx:tag\n";
         let f = write_temp(content).await;
         let image = tracked_image("nginx");
-        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
-            .await
-            .unwrap();
+        apply_filesystem_update(
+            &image,
+            &semver_result("2.0.0"),
+            f.path().to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
         let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
         assert_eq!(updated, content);
     }
@@ -362,9 +545,14 @@ mod tests {
         let content = "        tag: 1.0.0 # vt:nginx:tag\n";
         let f = write_temp(content).await;
         let image = tracked_image("nginx");
-        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
-            .await
-            .unwrap();
+        apply_filesystem_update(
+            &image,
+            &semver_result("2.0.0"),
+            f.path().to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
         let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
         assert!(updated.ends_with('\n'));
     }
@@ -374,9 +562,14 @@ mod tests {
         let content = "        tag: 1.0.0 # vt:nginx:tag";
         let f = write_temp(content).await;
         let image = tracked_image("nginx");
-        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
-            .await
-            .unwrap();
+        apply_filesystem_update(
+            &image,
+            &semver_result("2.0.0"),
+            f.path().to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
         let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
         assert!(!updated.ends_with('\n'));
     }
@@ -440,54 +633,41 @@ mod tests {
         };
         assert!(load_tracked_images(&config).await.is_err());
     }
-}
 
-/// Fetches the latest version of the given image according to its tracking strategy.
-pub async fn fetch_latest(
-    image: &TrackedImage,
-) -> Result<Option<TrackedImageResult>, anyhow::Error> {
-    tracing::debug!("Fetching image: {:?}", &image);
-    let client = Client::new(ClientConfig::default());
-    let reference: Reference = image.name.parse()?;
+    // --- resolve_auth ---
 
-    match &image.strategy {
-        TrackingStrategy::Latest => {
-            tracing::debug!("Tracking strategy: Latest");
-            // Rebuild the reference with the "latest" tag to fetch the manifest digest
-            let reference = Reference::with_tag(
-                reference.registry().to_owned(),
-                reference.repository().to_owned(),
-                "latest".to_owned(),
-            );
+    #[tokio::test]
+    async fn resolve_auth_basic_returns_basic() {
+        let creds = RegistryCredentials::Basic {
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+        };
+        let auth = resolve_auth(&creds).await.unwrap();
+        assert!(matches!(auth, RegistryAuth::Basic(u, p) if u == "user" && p == "pass"));
+    }
 
-            let digest = client.fetch_manifest_digest(&reference, &Anonymous).await?;
+    #[tokio::test]
+    async fn resolve_auth_bearer_returns_bearer() {
+        let creds = RegistryCredentials::Bearer {
+            token: "mytoken".to_owned(),
+        };
+        let auth = resolve_auth(&creds).await.unwrap();
+        assert!(matches!(auth, RegistryAuth::Bearer(t) if t == "mytoken"));
+    }
 
-            tracing::debug!("Latest tag: latest {}: {:?}", reference, digest);
+    #[tokio::test]
+    async fn resolve_auth_kubernetes_bad_ref_returns_err() {
+        let creds = RegistryCredentials::Kubernetes {
+            reference: "only-two/parts".to_owned(),
+        };
+        assert!(resolve_auth(&creds).await.is_err());
+    }
 
-            Ok(Some(TrackedImageResult::Digest(digest)))
-        }
-        TrackingStrategy::SemverPattern { pattern } => {
-            tracing::debug!("Tracking strategy: SemverPattern with pattern {}", pattern);
-            let response = client.list_tags(&reference, &Anonymous, None, None).await?;
-            let mut valid_tags = response
-                .tags
-                .into_iter()
-                .map(|tag| semver::Version::parse(&tag))
-                .filter(|tag| tag.is_ok())
-                .map(|tag| tag.unwrap())
-                .filter(|tag| pattern.matches(tag))
-                .collect::<Vec<_>>();
-            valid_tags.sort();
-
-            let latest_tag = valid_tags.last();
-
-            match latest_tag {
-                None => Ok(None),
-                Some(tag) => {
-                    tracing::debug!("Latest tag matching pattern {}: {}", pattern, tag);
-                    Ok(Some(TrackedImageResult::Semver(tag.to_owned())))
-                }
-            }
-        }
+    #[tokio::test]
+    async fn resolve_auth_kubernetes_unknown_resource_type_returns_err() {
+        let creds = RegistryCredentials::Kubernetes {
+            reference: "production/deployment/my-app".to_owned(),
+        };
+        assert!(resolve_auth(&creds).await.is_err());
     }
 }
