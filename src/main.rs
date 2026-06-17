@@ -60,6 +60,9 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
     tracing::info!("Starting version tracker...");
     let config = AppConfig::from_env();
     tracing::info!("Config: {:?}", &config);

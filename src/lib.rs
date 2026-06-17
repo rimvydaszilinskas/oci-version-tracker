@@ -1,4 +1,6 @@
 use anyhow::Ok;
+use k8s_openapi::api::core::v1::ConfigMap;
+use kube::{Api, Client as KubeClient};
 use serde::{Deserialize, Serialize};
 
 mod appconfig;
@@ -55,6 +57,7 @@ impl ToString for TrackedImageResult {
     }
 }
 
+/// Load the list of tracked images from the configured source (e.g. local file or Kubernetes ConfigMap).
 pub async fn load_tracked_images(config: &AppConfig) -> anyhow::Result<Vec<TrackedImage>> {
     match &config.image_source {
         appconfig::ImageSourceConfig::LocalFile { file_path } => {
@@ -62,12 +65,19 @@ pub async fn load_tracked_images(config: &AppConfig) -> anyhow::Result<Vec<Track
             let tracked_images: Vec<TrackedImage> = serde_yaml::from_reader(file.into_std().await)?;
             Ok(tracked_images)
         }
-        appconfig::ImageSourceConfig::KubernetesConfigMap {
-            namespace: _,
-            name: _,
-        } => Err(anyhow::anyhow!(
-            "KubernetesConfigMap source not implemented"
-        )),
+        appconfig::ImageSourceConfig::KubernetesConfigMap { namespace, name } => {
+            let client = KubeClient::try_default().await?;
+            let configmaps: Api<ConfigMap> = Api::namespaced(client, namespace);
+            let cm = configmaps.get(name).await?;
+            let data = cm
+                .data
+                .ok_or_else(|| anyhow::anyhow!("ConfigMap has no data"))?;
+            let yaml = data
+                .get("config.yaml")
+                .ok_or_else(|| anyhow::anyhow!("ConfigMap missing 'config.yaml' key"))?;
+            let tracked_images: Vec<TrackedImage> = serde_yaml::from_str(yaml)?;
+            Ok(tracked_images)
+        }
     }
 }
 
