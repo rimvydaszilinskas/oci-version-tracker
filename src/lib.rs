@@ -190,6 +190,258 @@ fn should_update(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn semver_result(v: &str) -> TrackedImageResult {
+        TrackedImageResult::Semver(semver::Version::parse(v).unwrap())
+    }
+
+    fn digest_result(d: &str) -> TrackedImageResult {
+        TrackedImageResult::Digest(d.to_owned())
+    }
+
+    fn tracked_image(name: &str) -> TrackedImage {
+        TrackedImage {
+            name: name.to_owned(),
+            strategy: TrackingStrategy::Latest,
+            update_strategies: vec![],
+        }
+    }
+
+    // --- should_update ---
+
+    #[test]
+    fn should_update_newer_semver() {
+        assert!(should_update("1.0.0", &semver_result("1.1.0"), false));
+    }
+
+    #[test]
+    fn should_update_same_semver_no_change() {
+        assert!(!should_update("1.1.0", &semver_result("1.1.0"), false));
+    }
+
+    #[test]
+    fn should_update_older_semver_no_change() {
+        assert!(!should_update("2.0.0", &semver_result("1.1.0"), false));
+    }
+
+    #[test]
+    fn should_update_unparseable_current_always_updates() {
+        assert!(should_update("not-a-version", &semver_result("1.1.0"), false));
+    }
+
+    #[test]
+    fn should_update_digest_always_updates() {
+        assert!(should_update("sha256:abc", &digest_result("sha256:xyz"), false));
+    }
+
+    #[test]
+    fn should_update_override_bypasses_semver_guard() {
+        assert!(should_update("2.0.0", &semver_result("1.0.0"), true));
+    }
+
+    // --- rewrite_line ---
+
+    #[test]
+    fn rewrite_line_no_marker_unchanged() {
+        let line = "        image: nginx:1.0.0";
+        assert_eq!(rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false), line);
+    }
+
+    #[test]
+    fn rewrite_line_wrong_image_unchanged() {
+        let line = "        tag: 1.0.0 # vt:other:tag";
+        assert_eq!(rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false), line);
+    }
+
+    #[test]
+    fn rewrite_line_tag_mode_updates_value() {
+        let line = "        tag: 1.0.0 # vt:nginx:tag";
+        let result = rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false);
+        assert_eq!(result, "        tag: 2.0.0 # vt:nginx:tag");
+    }
+
+    #[test]
+    fn rewrite_line_full_mode_updates_tag_portion() {
+        let line = "        image: nginx:1.0.0 # vt:nginx:full";
+        let result = rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false);
+        assert_eq!(result, "        image: nginx:2.0.0 # vt:nginx:full");
+    }
+
+    #[test]
+    fn rewrite_line_tag_mode_semver_guard_blocks_older() {
+        let line = "        tag: 2.0.0 # vt:nginx:tag";
+        let result = rewrite_line(line, "nginx", "1.0.0", &semver_result("1.0.0"), false);
+        assert_eq!(result, line);
+    }
+
+    #[test]
+    fn rewrite_line_tag_mode_override_ignores_guard() {
+        let line = "        tag: 2.0.0 # vt:nginx:tag";
+        let result = rewrite_line(line, "nginx", "1.0.0", &semver_result("1.0.0"), true);
+        assert_eq!(result, "        tag: 1.0.0 # vt:nginx:tag");
+    }
+
+    #[test]
+    fn rewrite_line_full_mode_digest_always_updates() {
+        let line = "        image: nginx:old-digest # vt:nginx:full";
+        let result = rewrite_line(line, "nginx", "sha256:abc", &digest_result("sha256:abc"), false);
+        assert_eq!(result, "        image: nginx:sha256:abc # vt:nginx:full");
+    }
+
+    #[test]
+    fn rewrite_line_preserves_trailing_whitespace_before_marker() {
+        let line = "        tag: 1.0.0  # vt:nginx:tag";
+        let result = rewrite_line(line, "nginx", "2.0.0", &semver_result("2.0.0"), false);
+        assert_eq!(result, "        tag: 2.0.0  # vt:nginx:tag");
+    }
+
+    // --- apply_filesystem_update ---
+
+    async fn write_temp(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    #[tokio::test]
+    async fn apply_filesystem_tag_line_updated() {
+        let content = "        tag: 1.0.0 # vt:nginx:tag\n";
+        let f = write_temp(content).await;
+        let image = tracked_image("nginx");
+        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
+        assert_eq!(updated, "        tag: 2.0.0 # vt:nginx:tag\n");
+    }
+
+    #[tokio::test]
+    async fn apply_filesystem_full_line_updated() {
+        let content = "        image: nginx:1.0.0 # vt:nginx:full\n";
+        let f = write_temp(content).await;
+        let image = tracked_image("nginx");
+        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
+        assert_eq!(updated, "        image: nginx:2.0.0 # vt:nginx:full\n");
+    }
+
+    #[tokio::test]
+    async fn apply_filesystem_only_matching_image_updated() {
+        let content = "        tag: 1.0.0 # vt:nginx:tag\n        tag: 3.0.0 # vt:other:tag\n";
+        let f = write_temp(content).await;
+        let image = tracked_image("nginx");
+        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
+        assert!(updated.contains("tag: 2.0.0 # vt:nginx:tag"));
+        assert!(updated.contains("tag: 3.0.0 # vt:other:tag"));
+    }
+
+    #[tokio::test]
+    async fn apply_filesystem_semver_guard_prevents_downgrade() {
+        let content = "        tag: 5.0.0 # vt:nginx:tag\n";
+        let f = write_temp(content).await;
+        let image = tracked_image("nginx");
+        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
+        assert_eq!(updated, content);
+    }
+
+    #[tokio::test]
+    async fn apply_filesystem_trailing_newline_preserved() {
+        let content = "        tag: 1.0.0 # vt:nginx:tag\n";
+        let f = write_temp(content).await;
+        let image = tracked_image("nginx");
+        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
+        assert!(updated.ends_with('\n'));
+    }
+
+    #[tokio::test]
+    async fn apply_filesystem_no_trailing_newline_preserved() {
+        let content = "        tag: 1.0.0 # vt:nginx:tag";
+        let f = write_temp(content).await;
+        let image = tracked_image("nginx");
+        apply_filesystem_update(&image, &semver_result("2.0.0"), f.path().to_str().unwrap(), false)
+            .await
+            .unwrap();
+        let updated = tokio::fs::read_to_string(f.path()).await.unwrap();
+        assert!(!updated.ends_with('\n'));
+    }
+
+    #[tokio::test]
+    async fn apply_filesystem_missing_file_returns_err() {
+        let image = tracked_image("nginx");
+        let result = apply_filesystem_update(
+            &image,
+            &semver_result("2.0.0"),
+            "/nonexistent/path/file.yml",
+            false,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    // --- load_tracked_images (LocalFile) ---
+
+    #[tokio::test]
+    async fn load_tracked_images_valid_yaml() {
+        let yaml = r#"
+- name: nginx
+  strategy:
+    type: latest
+  update_strategies:
+    - type: filesystem
+      path: ./target.yml
+"#;
+        let f = write_temp(yaml).await;
+        let config = AppConfig {
+            check_interval_seconds: 60,
+            image_source: appconfig::ImageSourceConfig::LocalFile {
+                file_path: f.path().to_str().unwrap().to_owned(),
+            },
+        };
+        let images = load_tracked_images(&config).await.unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].name, "nginx");
+    }
+
+    #[tokio::test]
+    async fn load_tracked_images_file_not_found() {
+        let config = AppConfig {
+            check_interval_seconds: 60,
+            image_source: appconfig::ImageSourceConfig::LocalFile {
+                file_path: "/nonexistent/path.yml".to_owned(),
+            },
+        };
+        assert!(load_tracked_images(&config).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_tracked_images_invalid_yaml() {
+        let f = write_temp("not: valid: yaml: [unclosed").await;
+        let config = AppConfig {
+            check_interval_seconds: 60,
+            image_source: appconfig::ImageSourceConfig::LocalFile {
+                file_path: f.path().to_str().unwrap().to_owned(),
+            },
+        };
+        assert!(load_tracked_images(&config).await.is_err());
+    }
+}
+
 /// Fetches the latest version of the given image according to its tracking strategy.
 pub async fn fetch_latest(
     image: &TrackedImage,

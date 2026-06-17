@@ -1,21 +1,3 @@
-# - name: nginx
-#   strategy:
-#     type: semver_pattern
-#     pattern: "0.x"
-# - name: redis
-#   strategy:
-#     type: latest
-# - name: gitlab.com/rim/test-image
-#   authentication:
-#     type: secret
-#     name: rim/gitlab-token
-#   strategy:
-#     type: semver_pattern
-#     pattern: "1.x"
-# - name: cimg/go
-#   strategy:
-#     type: semver_pattern
-#     pattern: "9.20.x"
 - name: cimg/go
   strategy:
     type: semver_pattern
