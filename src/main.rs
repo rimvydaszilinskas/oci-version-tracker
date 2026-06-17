@@ -37,6 +37,18 @@ async fn monitoring_loop(config: AppConfig) {
                             image,
                             version.to_string()
                         );
+                        for strategy in &image.update_strategies {
+                            match strategy {
+                                version_tracker::UpdateStrategy::Filesystem { path, override_version } => {
+                                    if let Err(e) = version_tracker::apply_filesystem_update(&image, &version, path, *override_version).await {
+                                        tracing::error!("Filesystem update failed for {:?}: {:?}", image, e);
+                                    } else {
+                                        tracing::info!("Updated {} in {}", image.name, path);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     Ok(None) => tracing::info!("No version found"),
                     Err(e) => tracing::error!("Error fetching image: {:?}", e),

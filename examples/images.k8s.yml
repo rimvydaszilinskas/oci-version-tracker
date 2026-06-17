@@ -9,7 +9,7 @@ data:
         type: semver_pattern
         pattern: "1.x"
       update_strategies:
-        - type: git
+        - type: filesystem
           branch: main
           path: ./examples/target.yml
           repository: github.com/rimvydaszilinskas/test-repo

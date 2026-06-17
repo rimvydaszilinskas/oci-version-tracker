@@ -22,9 +22,11 @@ enum TrackingStrategy {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum UpdateStrategy {
+pub enum UpdateStrategy {
     Filesystem {
         path: String,
+        #[serde(default)]
+        override_version: bool,
     },
     Git {
         repository: String,
@@ -36,11 +38,11 @@ enum UpdateStrategy {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TrackedImage {
     /// The name of the image to track, e.g. `nginx`.
-    name: String,
+    pub name: String,
     /// The strategy to use when tracking this image.
     strategy: TrackingStrategy,
     /// The strategies to use when updating this image.
-    update_strategies: Vec<UpdateStrategy>,
+    pub update_strategies: Vec<UpdateStrategy>,
 }
 
 pub enum TrackedImageResult {
@@ -78,6 +80,113 @@ pub async fn load_tracked_images(config: &AppConfig) -> anyhow::Result<Vec<Track
             let tracked_images: Vec<TrackedImage> = serde_yaml::from_str(yaml)?;
             Ok(tracked_images)
         }
+    }
+}
+
+pub async fn apply_filesystem_update(
+    image: &TrackedImage,
+    result: &TrackedImageResult,
+    path: &str,
+    override_version: bool,
+) -> anyhow::Result<()> {
+    let contents = fs::read_to_string(path).await?;
+    let new_version = result.to_string();
+
+    let updated = contents
+        .lines()
+        .map(|line| rewrite_line(line, &image.name, &new_version, result, override_version))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Preserve trailing newline if original had one
+    let updated = if contents.ends_with('\n') {
+        format!("{}\n", updated)
+    } else {
+        updated
+    };
+
+    fs::write(path, updated).await?;
+    Ok(())
+}
+
+fn rewrite_line(
+    line: &str,
+    image_name: &str,
+    new_version: &str,
+    result: &TrackedImageResult,
+    override_version: bool,
+) -> String {
+    let full_marker = format!("# vt:{}:full", image_name);
+    let tag_marker = format!("# vt:{}:tag", image_name);
+
+    let mode = if line.contains(&full_marker) {
+        "full"
+    } else if line.contains(&tag_marker) {
+        "tag"
+    } else {
+        return line.to_owned();
+    };
+
+    // Split line into value part and comment part
+    let marker = if mode == "full" { &full_marker } else { &tag_marker };
+    let (value_part, comment_part) = line.split_once(marker).unwrap();
+    // value_part ends with "  # " or " # " — keep that whitespace
+    let value_trimmed = value_part.trim_end();
+    let trailing_space = &value_part[value_trimmed.len()..];
+
+    if mode == "full" {
+        // value_trimmed looks like "  image: nginx:1.2.3" — find the image ref after the last colon
+        // Split on ": " to get the yaml key and value
+        if let Some((yaml_key, yaml_value)) = value_trimmed.split_once(": ") {
+            let current_tag = if let Some(pos) = yaml_value.rfind(':') {
+                &yaml_value[pos + 1..]
+            } else {
+                yaml_value
+            };
+
+            if !should_update(current_tag, result, override_version) {
+                return line.to_owned();
+            }
+
+            let new_value = if let Some(pos) = yaml_value.rfind(':') {
+                format!("{}{}", &yaml_value[..=pos], new_version)
+            } else {
+                new_version.to_owned()
+            };
+
+            format!("{}: {}{}{}{}", yaml_key, new_value, trailing_space, marker, comment_part)
+        } else {
+            line.to_owned()
+        }
+    } else {
+        // mode == "tag": value_trimmed looks like "  tag: 1.2.3"
+        if let Some((yaml_key, current_tag)) = value_trimmed.split_once(": ") {
+            if !should_update(current_tag, result, override_version) {
+                return line.to_owned();
+            }
+            format!("{}: {}{}{}{}", yaml_key, new_version, trailing_space, marker, comment_part)
+        } else {
+            line.to_owned()
+        }
+    }
+}
+
+fn should_update(
+    current: &str,
+    result: &TrackedImageResult,
+    override_version: bool,
+) -> bool {
+    if override_version {
+        return true;
+    }
+    match result {
+        TrackedImageResult::Semver(new) => {
+            match semver::Version::parse(current) {
+                std::result::Result::Ok(current_ver) => new > &current_ver,
+                std::result::Result::Err(_) => true,
+            }
+        }
+        TrackedImageResult::Digest(_) => true,
     }
 }
 
